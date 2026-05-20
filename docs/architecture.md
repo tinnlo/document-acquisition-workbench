@@ -208,6 +208,57 @@ The registry manifest (`metadata.json`) is the **canonical, mutable status recor
 
 **LangGraph parity:** `parse_node`, `extract_node`, and `chunk_node` are independent node functions in `doc_workbench/orchestration/nodes.py`. `build_intake_graph()` in `doc_workbench/orchestration/graph.py` composes: `parse → extract → chunk → END`. `extract_node` reads `state["parse_records"]` and writes `state["extraction_records"]`; `chunk_node` reads `state["extraction_records"]` and writes `state["chunk_records"]`.
 
+### Parse routing decision table
+
+| `content_type` | Condition | `modality` | `parse_strategy` | `text_layer_present` |
+|---|---|---|---|---|
+| `application/pdf` | `sampled_avg_chars_per_page >= 100` | `text_selectable` | `native_pdf_text` | `True` |
+| `application/pdf` | `sampled_avg_chars_per_page < 100` | `image_or_unknown` | `ocr_fallback` | `False` |
+| `text/html` | always | `html` | `html_parse` | `True` |
+| anything else | always | `unsupported` | `skipped` | `False` |
+
+Sampling: up to the first 10 pages are inspected (`_SAMPLE_MAX_PAGES = 10`). Quality signals emitted: `sampled_pages`, `sampled_nonempty_page_ratio`, `sampled_avg_chars_per_page`, `empty_page_count`. `text_coverage_ratio` is intentionally absent — sampling over a few pages produces an unreliable denominator.
+
+### Post-download acceptance and risk scoring
+
+Risk level is composite — no single confidence score:
+
+| Signal | Risk contribution |
+|---|---|
+| `parse_status == "failed"` | → `high` (immediate override) |
+| `parse_status == "partial"` | + `medium` |
+| `text_layer_present == False` | + `medium` |
+| `title` empty or missing | + `medium` |
+| `page_count` is `None` or `<= 0` | + `low` |
+| `sampled_nonempty_page_ratio < 0.5` | + `low` |
+| any `validation_errors` | + `low` per error |
+
+Final rule: any `high` → `risk_level="high"`; one or more `medium` → `"medium"`; else `"low"`.
+
+Acceptance classification:
+
+| Condition | `indexing_acceptance` |
+|---|---|
+| `parse_status == "failed"` OR `risk_level == "high"` | `rejected_for_indexing` |
+| `parse_status == "complete"` AND `risk_level == "low"` AND no `validation_errors` | `index_ready` |
+| everything else | `needs_document_review` |
+
+`indexing_acceptance` lives only in the `extraction_record` sidecar — it is never written to the manifest.
+
+### Production storage analogy
+
+This repo uses local JSON sidecars. A production system would map the same artifacts as:
+
+| Local (this repo) | Production analogy |
+|---|---|
+| `metadata.json` | canonical row in a documents table |
+| `analysis/parse_record.<ts>.json` | append-only row in a parse events log |
+| `analysis/extraction_record.<ts>.json` | versioned record in an extractions store (e.g. PostgreSQL `JSONB`) |
+| `analysis/chunks.<ts>.jsonl` | rows in a chunks + retrieval index |
+| raw artifact file | object storage keyed by content hash |
+
+No database, vector store, or remote backend is implemented here. This mapping documents intent only.
+
 ## Observability Model
 
 Two observability layers run in parallel:

@@ -380,6 +380,9 @@ Per-fixture metrics:
 | Execution policy enforcement | `doc_workbench/execution_policy.py` |
 | Safe remote observability | `doc_workbench/observability/langfuse_bridge.py` |
 | Review classification and queue building | `doc_workbench/review/workflow.py` |
+| Post-download parse routing and quality signals | `doc_workbench/intake/detector.py` and `doc_workbench/intake/parser.py` |
+| Versioned extraction records and risk scoring | `doc_workbench/intake/extractor.py` |
+| Retrieval-ready chunk packaging | `doc_workbench/knowledge/chunker.py` and `doc_workbench/knowledge/packager.py` |
 | Installable regression harness | `doc_workbench/evals/run_evals.py` |
 | Hardened local runtime | `docs/hardened-runtime.md` |
 
