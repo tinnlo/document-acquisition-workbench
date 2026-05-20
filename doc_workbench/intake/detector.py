@@ -46,7 +46,6 @@ def detect_parse_strategy(
         return "image_or_unknown", "ocr_fallback", False, {}
 
     pages = reader.pages
-    total_pages = len(pages)
     sample_pages = pages[:_SAMPLE_MAX_PAGES]
     sampled_count = len(sample_pages)
 

@@ -407,7 +407,6 @@ def test_parse_node_rejects_exec_policy_without_workspace_root(tmp_path: Path) -
     # Register a real download-complete document so parse_node reaches the artifact guard.
     registry_root = tmp_path / "registry"
     registry = DocumentRegistry(registry_root)
-    import io
     minimal_pdf = (
         b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
         b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
@@ -572,7 +571,6 @@ def test_extract_node_happy_path(tmp_path: Path) -> None:
 def test_chunk_node_happy_path_uses_exact_sidecar(tmp_path: Path) -> None:
     """chunk_node must use extraction_sidecar_filename from state (not a disk scan)."""
     from doc_workbench.orchestration.nodes import parse_node, extract_node, chunk_node
-    from doc_workbench.registry.document_registry import DocumentRegistry
 
     registry_root, doc_id = _make_registry_with_pdf(tmp_path)
     state: WorkbenchState = {
@@ -589,7 +587,8 @@ def test_chunk_node_happy_path_uses_exact_sidecar(tmp_path: Path) -> None:
     # Write a *second* competing extraction sidecar for the same document so
     # that a disk-scan implementation (list_analysis_sidecars[-1]) would pick
     # the wrong file.  The node must use the filename from state, not the latest.
-    import json, time as _time
+    import json
+    import time as _time
     from doc_workbench.registry.document_registry import DocumentRegistry as _R
     registry = _R(registry_root)
     analysis_dir = registry.ensure_analysis_dir(doc_id)
@@ -770,7 +769,7 @@ def test_chunk_node_reads_fresh_manifest_after_parse_resets_chunking(tmp_path: P
     state = {**state, **parse_result}
     extract_result = extract_node(state)
     state = {**state, **extract_result}
-    chunk_result = chunk_node(state)
+    chunk_node(state)
 
     # chunk_node must have acted on the document — chunking_status must move away
     # from "complete" to either "complete" (re-chunked) or "skipped" (not index_ready),
@@ -785,7 +784,6 @@ def test_chunk_node_reads_fresh_manifest_after_parse_resets_chunking(tmp_path: P
     #
     # We detect the regression by checking that chunk_node wrote at least one result
     # entry (skipped silently → empty results, no registry write beyond what parse set).
-    chunk_records = chunk_result.get("chunk_records") or []
     final_manifest = registry.get_manifest(doc_id)
     final_chunking = (final_manifest.get("pipeline_status") or {}).get("chunking_status")
 

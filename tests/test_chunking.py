@@ -1,11 +1,9 @@
 """Tests for doc_workbench.knowledge — chunker, packager, models."""
 from __future__ import annotations
 
-import json
 from io import BytesIO
 from pathlib import Path
 
-from pypdf import PdfWriter
 
 from doc_workbench.intake.models import ParseRecord
 from doc_workbench.intake.extractor import ExtractionRecord
@@ -33,7 +31,7 @@ def _text_pdf_bytes(text: str = "Hello world this is page text.", pages: int = 2
         page_obj = page.get_object()
         page_obj[NameObject("/Contents")] = writer._add_object(stream)
         # Add a minimal font resource so the text is readable
-        from pypdf.generic import DictionaryObject, ArrayObject
+        from pypdf.generic import DictionaryObject
         page_obj.setdefault(NameObject("/Resources"), DictionaryObject())
     buf = BytesIO()
     writer.write(buf)

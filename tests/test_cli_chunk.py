@@ -79,7 +79,7 @@ def test_chunk_all_runs_without_error(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     policy_file = _exec_policy(tmp_path)
-    doc_id = _register_and_analyze(workspace)
+    _register_and_analyze(workspace)
 
     result = runner.invoke(cli.app, [
         "chunk", "--all",
@@ -209,7 +209,7 @@ def test_chunk_invalid_parse_record_ref_sets_failed(tmp_path: Path) -> None:
     extraction_data["parse_record_ref"] = "../../../etc/passwd"
     extraction_paths[-1].write_text(json.dumps(extraction_data), encoding="utf-8")
 
-    result = runner.invoke(cli.app, [
+    runner.invoke(cli.app, [
         "chunk", "--all",
         "--workspace-root", str(workspace),
         "--execution-policy-path", str(policy_file),
@@ -241,7 +241,7 @@ def test_chunk_rejects_symlinked_artifact(tmp_path: Path) -> None:
     rel = link_path.relative_to(registry_root)
     registry.update_manifest(doc_id, {"local_path": str(rel)})
 
-    result = runner.invoke(cli.app, [
+    runner.invoke(cli.app, [
         "chunk", "--all",
         "--workspace-root", str(workspace),
         "--execution-policy-path", str(policy_file),

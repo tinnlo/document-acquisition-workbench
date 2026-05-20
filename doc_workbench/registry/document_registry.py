@@ -8,13 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from doc_workbench.config import slugify
+from doc_workbench.models import RegistrationResult
+
 # Regex for valid sidecar basenames (used in write_analysis_sidecar + list_analysis_sidecars).
 _BASENAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 # Regex for valid sidecar filenames returned by list_analysis_sidecars.
 _SIDECAR_FILE_RE = re.compile(r"^(?P<base>[a-zA-Z0-9_]+)\.\d{8}T\d{6}\d+Z\.(json|jsonl)$")
-
-from doc_workbench.config import slugify
-from doc_workbench.models import RegistrationResult
 
 # Characters that are safe in a single path component.
 # Strips OS path separators, null bytes, and common traversal patterns.

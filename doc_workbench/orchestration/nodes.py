@@ -526,7 +526,6 @@ def parse_node(state: WorkbenchState) -> dict:
         from doc_workbench.execution_policy import enforce_command_stage as _enforce
         _enforce(exec_policy, "analyze")
 
-    import json as _json
     from doc_workbench.registry.document_registry import DocumentRegistry
     from doc_workbench.intake.parser import run_parse
     from doc_workbench.intake.validation import validate_parse_record

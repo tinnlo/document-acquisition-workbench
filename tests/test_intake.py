@@ -1,11 +1,8 @@
 """Tests for doc_workbench.intake — parser, models, detector, validation."""
 from __future__ import annotations
 
-from io import BytesIO
 from pathlib import Path
 
-import pytest
-from pypdf import PdfWriter
 
 from doc_workbench.intake.models import ParseRecord
 from doc_workbench.intake.parser import run_parse
