@@ -611,12 +611,18 @@ def scan(
             if artifact_path.exists():
                 enforce_file_size(exec_policy, artifact_path.stat().st_size, str(artifact_path))
             result = scan_pdf(artifact_path, content_type=str(manifest.get("content_type") or "application/pdf"))
+            prior_pipeline = (manifest.get("pipeline_status") or {})
+            scan_manifest_updates: dict = {
+                "metadata": result,
+                "pipeline_status": {"metadata_scan_status": result["status"]},
+            }
+            # If a prior analyze pass completed, reset parse_status so that
+            # analyze --all knows the scan metadata has changed and must re-run.
+            if prior_pipeline.get("parse_status") == "complete":
+                scan_manifest_updates["pipeline_status"]["parse_status"] = "pending"
             updated = registry.update_manifest(
                 str(manifest["document_id"]),
-                {
-                    "metadata": result,
-                    "pipeline_status": {"metadata_scan_status": result["status"]},
-                },
+                scan_manifest_updates,
             )
             rows.append(
                 MetadataScanRow(
@@ -721,7 +727,8 @@ def analyze(
                 console.print(f"[yellow]skip[/yellow] {document_id}: download_status={download_status!r}")
                 continue
 
-            if parse_status == "complete" and not force:
+            metadata_scan_status = pipeline_status.get("metadata_scan_status", "pending")
+            if parse_status == "complete" and metadata_scan_status == "complete" and not force:
                 skipped.append({"document_id": document_id, "reason": "parse_status=complete (use --force to re-run)"})
                 console.print(f"[dim]skip[/dim] {document_id}: already analyzed")
                 continue
@@ -762,10 +769,12 @@ def analyze(
                     document_id, "extraction_record", extraction.to_dict()
                 )
 
-                # --- update manifest parse_status ---
-                registry.update_manifest(document_id, {
-                    "pipeline_status": {"parse_status": record.parse_status}
-                })
+                # --- update manifest parse_status; reset chunking if a prior run completed ---
+                chunking_status = pipeline_status.get("chunking_status", "pending")
+                manifest_updates: dict = {"pipeline_status": {"parse_status": record.parse_status}}
+                if chunking_status == "complete":
+                    manifest_updates["pipeline_status"]["chunking_status"] = "pending"
+                registry.update_manifest(document_id, manifest_updates)
 
                 processed.append({
                     "document_id": document_id,

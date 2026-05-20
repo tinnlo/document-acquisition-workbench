@@ -545,7 +545,10 @@ def parse_node(state: WorkbenchState) -> dict:
     for manifest in manifests:
         document_id = str(manifest.get("document_id") or "")
         pipeline_status = manifest.get("pipeline_status") or {}
-        if pipeline_status.get("parse_status") == "complete" and not force:
+        metadata_scan_status = pipeline_status.get("metadata_scan_status", "pending")
+        if (pipeline_status.get("parse_status") == "complete"
+                and metadata_scan_status == "complete"
+                and not force):
             continue
         if pipeline_status.get("download_status") != "complete":
             continue
@@ -566,9 +569,12 @@ def parse_node(state: WorkbenchState) -> dict:
             parse_sidecar_path = registry.write_analysis_sidecar(
                 document_id, "parse_record", record.to_dict()
             )
-            registry.update_manifest(document_id, {
-                "pipeline_status": {"parse_status": record.parse_status}
-            })
+            # Update parse_status; reset chunking_status if a prior run completed it
+            # so that chunk_node re-emits fresh output rather than skipping.
+            parse_manifest_updates: dict = {"pipeline_status": {"parse_status": record.parse_status}}
+            if pipeline_status.get("chunking_status") == "complete":
+                parse_manifest_updates["pipeline_status"]["chunking_status"] = "pending"
+            registry.update_manifest(document_id, parse_manifest_updates)
             results.append({
                 "document_id": document_id,
                 "parse_status": record.parse_status,
@@ -706,6 +712,12 @@ def chunk_node(state: WorkbenchState) -> dict:
             continue
 
         manifest = entry.get("manifest") or {}
+        # Re-read the manifest from the registry so that status resets applied
+        # by parse_node (e.g. chunking_status → "pending") are visible here,
+        # rather than relying on the snapshot captured in state.
+        live_manifest = registry.get_manifest(document_id)
+        if live_manifest:
+            manifest = live_manifest
         pipeline_status = manifest.get("pipeline_status") or {}
         if pipeline_status.get("chunking_status") == "complete" and not force:
             continue

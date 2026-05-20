@@ -643,3 +643,156 @@ def test_chunk_node_rejects_traversal_extraction_sidecar_filename(tmp_path: Path
     }
     with pytest.raises(ValueError, match="Invalid extraction sidecar filename"):
         chunk_node(tampered_state)
+
+
+# ---------------------------------------------------------------------------
+# Stale-state transition tests (P1 + P2 parity with CLI fixes)
+# ---------------------------------------------------------------------------
+
+def test_parse_node_reruns_when_metadata_scan_not_complete(tmp_path: Path) -> None:
+    """parse_node must re-run even if parse_status=complete when metadata_scan_status is not complete."""
+    from doc_workbench.orchestration.nodes import parse_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    registry = DocumentRegistry(registry_root)
+
+    # Seed: parse already done but scan is stale (never completed).
+    registry.update_manifest(doc_id, {
+        "pipeline_status": {"parse_status": "complete", "metadata_scan_status": "pending"}
+    })
+
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    result = parse_node(state)
+
+    # Document must be processed, not silently skipped.
+    assert len(result["parse_records"]) == 1, (
+        "parse_node skipped a document with stale metadata_scan_status"
+    )
+    assert result["parse_records"][0]["document_id"] == doc_id
+    assert "error" not in result["parse_records"][0]
+
+
+def test_parse_node_resets_chunking_status_on_reanalysis(tmp_path: Path) -> None:
+    """parse_node must reset chunking_status=pending when it rewrites parse/extraction sidecars."""
+    from doc_workbench.orchestration.nodes import parse_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    registry = DocumentRegistry(registry_root)
+
+    # Seed a fully-complete prior pipeline run; force=True bypasses the skip guard.
+    registry.update_manifest(doc_id, {
+        "pipeline_status": {
+            "parse_status": "complete",
+            "metadata_scan_status": "complete",
+            "chunking_status": "complete",
+        }
+    })
+
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+        "intake_force": True,
+    }
+    parse_node(state)
+
+    manifest_after = registry.get_manifest(doc_id)
+    chunking_status = (manifest_after.get("pipeline_status") or {}).get("chunking_status")
+    assert chunking_status == "pending", (
+        f"parse_node should have reset chunking_status to 'pending', got {chunking_status!r}"
+    )
+
+
+def test_parse_node_resets_chunking_status_on_stale_scan_rerun(tmp_path: Path) -> None:
+    """parse_node must also reset chunking_status when re-running due to stale scan (no --force)."""
+    from doc_workbench.orchestration.nodes import parse_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    registry = DocumentRegistry(registry_root)
+
+    # Seed: parse done, chunked, but scan is stale → parse_node re-runs without force.
+    registry.update_manifest(doc_id, {
+        "pipeline_status": {
+            "parse_status": "complete",
+            "metadata_scan_status": "pending",
+            "chunking_status": "complete",
+        }
+    })
+
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+        # No intake_force — the stale scan status alone must trigger the reset.
+    }
+    parse_node(state)
+
+    manifest_after = registry.get_manifest(doc_id)
+    chunking_status = (manifest_after.get("pipeline_status") or {}).get("chunking_status")
+    assert chunking_status == "pending", (
+        f"parse_node should have reset chunking_status to 'pending' on stale-scan rerun, "
+        f"got {chunking_status!r}"
+    )
+
+
+def test_chunk_node_reads_fresh_manifest_after_parse_resets_chunking(tmp_path: Path) -> None:
+    """chunk_node must not skip when parse_node has just reset chunking_status to pending."""
+    from doc_workbench.orchestration.nodes import parse_node, extract_node, chunk_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    registry = DocumentRegistry(registry_root)
+
+    # Seed chunking_status=complete so the stale manifest in state would cause a skip.
+    registry.update_manifest(doc_id, {
+        "pipeline_status": {
+            "chunking_status": "complete",
+            "metadata_scan_status": "pending",  # stale scan → parse_node won't skip
+        }
+    })
+
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    parse_result = parse_node(state)
+
+    # parse_node must have reset chunking_status in the registry.
+    manifest_mid = registry.get_manifest(doc_id)
+    assert (manifest_mid.get("pipeline_status") or {}).get("chunking_status") == "pending", (
+        "parse_node did not reset chunking_status to pending after reanalysis"
+    )
+
+    state = {**state, **parse_result}
+    extract_result = extract_node(state)
+    state = {**state, **extract_result}
+    chunk_result = chunk_node(state)
+
+    # chunk_node must have acted on the document — chunking_status must move away
+    # from "complete" to either "complete" (re-chunked) or "skipped" (not index_ready),
+    # but crucially it must have been written by *this* chunk_node run, not left as
+    # the seeded "complete" from before the parse reset.
+    #
+    # The discriminant: if chunk_node skipped due to the stale manifest (the bug),
+    # it would return an empty chunk_records list AND never call update_manifest, so
+    # the registry would still show the seeded "complete".  After the fix, chunk_node
+    # reads the live manifest (chunking_status="pending") and processes the document,
+    # leaving chunking_status as "complete" (re-chunked) or "skipped" (rejected).
+    #
+    # We detect the regression by checking that chunk_node wrote at least one result
+    # entry (skipped silently → empty results, no registry write beyond what parse set).
+    chunk_records = chunk_result.get("chunk_records") or []
+    final_manifest = registry.get_manifest(doc_id)
+    final_chunking = (final_manifest.get("pipeline_status") or {}).get("chunking_status")
+
+    # chunk_node must have produced an outcome — either a chunk_records entry (for
+    # complete/failed) or a registry update to "skipped".  Empty records + "pending"
+    # means it silently did nothing, which is the stale-manifest regression.
+    assert final_chunking != "pending", (
+        "chunk_node left chunking_status=pending, meaning it skipped the document "
+        "without processing it — stale manifest regression"
+    )

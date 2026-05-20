@@ -167,9 +167,9 @@ def test_analyze_skips_already_complete_without_force(tmp_path: Path) -> None:
     doc_id = _register_downloaded_pdf(registry_root)
     policy_file = _exec_policy(tmp_path)
 
-    # Manually set parse_status=complete so the CLI skip-guard triggers
+    # Both parse_status and metadata_scan_status must be complete for the skip-guard to trigger.
     from doc_workbench.registry.document_registry import DocumentRegistry as _R
-    _R(registry_root).update_manifest(doc_id, {"pipeline_status": {"parse_status": "complete"}})
+    _R(registry_root).update_manifest(doc_id, {"pipeline_status": {"parse_status": "complete", "metadata_scan_status": "complete"}})
 
     result = runner.invoke(cli.app, [
         "analyze", "--all",
@@ -310,3 +310,117 @@ def test_analyze_rejects_symlinked_artifact(tmp_path: Path) -> None:
     # Symlink rejection → error entry; parse_status must NOT be complete
     parse_status = manifest_after.get("pipeline_status", {}).get("parse_status", "pending")
     assert parse_status != "complete"
+
+
+# ---------------------------------------------------------------------------
+# analyze: stale scan guard (P1)
+# ---------------------------------------------------------------------------
+
+def test_analyze_reruns_when_metadata_scan_pending(tmp_path: Path) -> None:
+    """analyze should re-run even if parse_status=complete when metadata_scan_status is not complete."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry_root = workspace / "registry"
+    doc_id = _register_downloaded_pdf(registry_root)
+    policy_file = _exec_policy(tmp_path)
+
+    # Simulate a prior analyze pass: parse done, but scan was never completed.
+    from doc_workbench.registry.document_registry import DocumentRegistry as _R
+    _R(registry_root).update_manifest(doc_id, {"pipeline_status": {"parse_status": "complete", "metadata_scan_status": "pending"}})
+
+    result = runner.invoke(cli.app, [
+        "analyze", "--all",
+        "--workspace-root", str(workspace),
+        "--execution-policy-path", str(policy_file),
+    ])
+    assert result.exit_code == 0, result.output
+    run_dirs = sorted((workspace / "runs").glob("analyze_*"))
+    data = json.loads((run_dirs[-1] / "analyze_results.json").read_text())
+    # Document must be in processed, not skipped
+    assert any(r["document_id"] == doc_id for r in data["processed"]), data
+    assert not any(r["document_id"] == doc_id for r in data["skipped"]), data
+
+
+# ---------------------------------------------------------------------------
+# analyze: chunking invalidation (P2)
+# ---------------------------------------------------------------------------
+
+def test_analyze_resets_chunking_status_when_reanalyzed(tmp_path: Path) -> None:
+    """analyze --force should reset chunking_status=pending so chunk --all re-emits fresh output."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry_root = workspace / "registry"
+    doc_id = _register_downloaded_pdf(registry_root)
+    policy_file = _exec_policy(tmp_path)
+
+    # Simulate a fully-complete prior pipeline run.
+    from doc_workbench.registry.document_registry import DocumentRegistry as _R
+    _R(registry_root).update_manifest(doc_id, {
+        "pipeline_status": {
+            "parse_status": "complete",
+            "metadata_scan_status": "complete",
+            "chunking_status": "complete",
+        }
+    })
+
+    result = runner.invoke(cli.app, [
+        "analyze", "--all", "--force",
+        "--workspace-root", str(workspace),
+        "--execution-policy-path", str(policy_file),
+    ])
+    assert result.exit_code == 0, result.output
+
+    registry = DocumentRegistry(registry_root)
+    manifest_after = registry.get_manifest(doc_id)
+    chunking_status = manifest_after.get("pipeline_status", {}).get("chunking_status", "pending")
+    assert chunking_status == "pending", f"Expected chunking_status=pending after re-analyze, got {chunking_status!r}"
+
+
+# ---------------------------------------------------------------------------
+# analyze: scan --force followed by analyze --all (P1 regression)
+# ---------------------------------------------------------------------------
+
+def test_analyze_reruns_after_forced_scan_refresh(tmp_path: Path) -> None:
+    """scan --force must invalidate parse_status so analyze --all does not skip on stale extraction."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry_root = workspace / "registry"
+    doc_id = _register_downloaded_pdf(registry_root)
+    policy_file = _exec_policy(tmp_path)
+
+    # Seed a fully-complete prior pipeline state (mirrors what a real first-pass produces).
+    from doc_workbench.registry.document_registry import DocumentRegistry as _R
+    _R(registry_root).update_manifest(doc_id, {
+        "pipeline_status": {
+            "parse_status": "complete",
+            "metadata_scan_status": "complete",
+            "chunking_status": "complete",
+        }
+    })
+
+    # Re-scan with --force (simulates updated PDF metadata).
+    runner.invoke(cli.app, [
+        "scan", "--all", "--force",
+        "--workspace-root", str(workspace),
+        "--execution-policy-path", str(policy_file),
+    ])
+
+    # After a forced scan, parse_status must be reset so analyze --all re-runs.
+    manifest_after_scan = _R(registry_root).get_manifest(doc_id)
+    assert manifest_after_scan.get("pipeline_status", {}).get("parse_status") != "complete", (
+        "scan --force should have reset parse_status to pending"
+    )
+
+    # Confirm analyze --all processes (not skips) the document.
+    result = runner.invoke(cli.app, [
+        "analyze", "--all",
+        "--workspace-root", str(workspace),
+        "--execution-policy-path", str(policy_file),
+    ])
+    assert result.exit_code == 0, result.output
+    run_dirs = sorted((workspace / "runs").glob("analyze_*"))
+    data = json.loads((run_dirs[-1] / "analyze_results.json").read_text())
+    assert any(r["document_id"] == doc_id for r in data["processed"]), (
+        "analyze --all must re-process after scan --force, not skip"
+    )
+    assert not any(r["document_id"] == doc_id for r in data["skipped"]), data
