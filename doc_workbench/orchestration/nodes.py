@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -25,6 +26,12 @@ from doc_workbench.orchestration.state import WorkbenchState
 from doc_workbench.policy import ContextPolicy
 from doc_workbench.review.workflow import build_review_rows_from_records
 from doc_workbench.execution_policy import PolicyViolationError, enforce_followup_search
+from doc_workbench.intake.guards import (
+    check_artifact_path as _guard_artifact,
+    check_sidecar_path as _guard_sidecar,
+    validate_parse_sidecar_basename as _validate_parse_sidecar_basename_shared,
+    validate_extraction_sidecar_basename as _validate_extraction_sidecar_basename_shared,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -418,3 +425,389 @@ def review_prep_node(state: WorkbenchState) -> dict[str, Any]:
         "review_trace": review_trace,
         "recommendation_summary": recommendation_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Intake node functions (parse / extract / chunk)
+# ---------------------------------------------------------------------------
+
+def _require_intake_target(state: WorkbenchState) -> None:
+    """Raise ValueError if none of the three intake target selectors are set."""
+    if (
+        not state.get("intake_all")
+        and not state.get("intake_entity_id")
+        and not state.get("intake_document_ids")
+    ):
+        raise ValueError(
+            "At least one of intake_document_ids, intake_entity_id, or intake_all=True "
+            "must be set in state before calling intake nodes."
+        )
+
+
+_DEFAULT_MAX_FILE_BYTES = 52_428_800  # 50 MiB — mirrors execution policy default
+
+
+def _enforce_registry_root_node(state: WorkbenchState, artifact_path: "Path") -> None:
+    """Enforce exec_policy.registry.root_restriction parity with the CLI.
+
+    When *exec_policy* is present in state, *intake_workspace_root* **must** also
+    be provided — mirroring the CLI, which always passes the workspace root.
+    Raises ``PolicyViolationError`` (not ``ValueError``) when *intake_workspace_root*
+    is absent and an *exec_policy* is in effect, so callers cannot silently bypass
+    the restriction check.
+
+    When *exec_policy* is absent (e.g. integration tests without policy), the call
+    is a no-op; the shared ``_guard_artifact`` / ``_guard_sidecar`` helpers still
+    enforce basic registry-root containment.
+    """
+    exec_policy = state.get("exec_policy")
+    if exec_policy is None:
+        return
+    workspace_root = state.get("intake_workspace_root")
+    if workspace_root is None:
+        from doc_workbench.execution_policy import PolicyViolationError
+        raise PolicyViolationError(
+            "intake_workspace_root must be set in state whenever exec_policy is present. "
+            "This is required to enforce registry.root_restriction parity with the CLI."
+        )
+    from doc_workbench.execution_policy import enforce_registry_root as _err
+    _err(exec_policy, artifact_path, Path(workspace_root))
+
+
+def _max_file_bytes(state: WorkbenchState) -> int:
+    """Return the file-size limit to apply in intake nodes.
+
+    Reads from ``state["exec_policy"].download.max_file_size_bytes`` when an
+    execution policy is present; otherwise falls back to the 50 MiB default.
+    """
+    exec_policy = state.get("exec_policy")
+    try:
+        if exec_policy is not None:
+            return int(exec_policy.download.max_file_size_bytes)
+    except Exception:
+        pass
+    return _DEFAULT_MAX_FILE_BYTES
+
+
+def _validate_parse_sidecar_filename(filename: str) -> str:
+    """Return a validated parse sidecar basename.
+
+    Accepts only bare filenames matching
+    ``parse_record.<timestamp>.json`` where timestamp is the project's
+    microsecond-precision UTC form.
+    """
+    import re as _re
+
+    pattern = _re.compile(r"^parse_record\.\d{8}T\d{6}\d+Z\.json$")
+    basename = Path(filename).name
+    if basename != filename or not pattern.match(basename):
+        raise ValueError(
+            f"Invalid parse sidecar filename {filename!r}. "
+            "Must be a bare filename matching parse_record.<ts>.json"
+        )
+    return basename
+
+
+def parse_node(state: WorkbenchState) -> dict:
+    """LangGraph node: parse all targeted documents.
+
+    Reads:  intake_document_ids | intake_entity_id | intake_all
+            intake_force, intake_registry_root
+    Writes: parse_records
+
+    Each entry in parse_records contains:
+      document_id, parse_status, parse_sidecar_filename, validation_errors,
+      manifest (pass-through for extract_node), or error.
+    """
+    _require_intake_target(state)
+
+    exec_policy = state.get("exec_policy")
+    if exec_policy is not None:
+        from doc_workbench.execution_policy import enforce_command_stage as _enforce
+        _enforce(exec_policy, "analyze")
+
+    import json as _json
+    from doc_workbench.registry.document_registry import DocumentRegistry
+    from doc_workbench.intake.parser import run_parse
+    from doc_workbench.intake.validation import validate_parse_record
+
+    registry = DocumentRegistry(state["intake_registry_root"])
+    entity_id: str = state.get("intake_entity_id") or ""
+    doc_ids: list[str] = state.get("intake_document_ids") or []
+    force: bool = bool(state.get("intake_force"))
+    registry_root = state["intake_registry_root"]
+
+    manifests = registry.list_manifests(entity_id or None)
+    if doc_ids:
+        manifests = [m for m in manifests if str(m.get("document_id") or "") in doc_ids]
+
+    results: list[dict] = []
+    for manifest in manifests:
+        document_id = str(manifest.get("document_id") or "")
+        pipeline_status = manifest.get("pipeline_status") or {}
+        if pipeline_status.get("parse_status") == "complete" and not force:
+            continue
+        if pipeline_status.get("download_status") != "complete":
+            continue
+
+        artifact_path = registry._normalize_manifest_path(str(manifest["local_path"]))
+        try:
+            # Enforce root_restriction parity with CLI, then containment/symlink/size guards.
+            _enforce_registry_root_node(state, artifact_path)
+            _guard_artifact(artifact_path, Path(registry_root).resolve(), _max_file_bytes(state))
+
+            record = run_parse(
+                document_id=document_id,
+                local_path=artifact_path,
+                manifest=manifest,
+                run_id="langgraph",
+            )
+            validation_errs = validate_parse_record(record)
+            parse_sidecar_path = registry.write_analysis_sidecar(
+                document_id, "parse_record", record.to_dict()
+            )
+            registry.update_manifest(document_id, {
+                "pipeline_status": {"parse_status": record.parse_status}
+            })
+            results.append({
+                "document_id": document_id,
+                "parse_status": record.parse_status,
+                "parse_sidecar_filename": parse_sidecar_path.name,
+                "validation_errors": validation_errs,
+                "manifest": manifest,
+            })
+        except Exception as exc:
+            from doc_workbench.execution_policy import PolicyViolationError as _PVE
+            if isinstance(exc, (_PVE, ValueError)):
+                raise
+            results.append({
+                "document_id": document_id,
+                "error": f"{type(exc).__name__}: {exc}",
+                "manifest": manifest,
+            })
+
+    return {"parse_records": results}
+
+
+def extract_node(state: WorkbenchState) -> dict:
+    """LangGraph node: run extraction over documents processed by parse_node.
+
+    Reads:  parse_records (from state), intake_registry_root
+    Writes: extraction_records
+
+    Each successful entry in extraction_records includes an
+    ``extraction_sidecar_filename`` key containing the exact timestamped
+    filename written during this run.  chunk_node uses that filename directly
+    so it never accidentally picks up a later or tampered sidecar.
+
+    Iterates over parse_records entries that have a parse_sidecar_filename
+    (i.e. successfully parsed).  Documents with errors in parse_records are
+    passed through with an error entry in extraction_records.
+    """
+    exec_policy = state.get("exec_policy")
+    if exec_policy is not None:
+        from doc_workbench.execution_policy import enforce_command_stage as _enforce
+        _enforce(exec_policy, "analyze")
+
+    from doc_workbench.registry.document_registry import DocumentRegistry
+    from doc_workbench.intake.extractor import run_extraction
+
+    registry = DocumentRegistry(state["intake_registry_root"])
+    parse_records: list[dict] = state.get("parse_records") or []
+
+    results: list[dict] = []
+    for entry in parse_records:
+        document_id = str(entry.get("document_id") or "")
+        if "error" in entry or not entry.get("parse_sidecar_filename"):
+            results.append({
+                "document_id": document_id,
+                "error": entry.get("error", "no parse_sidecar_filename available"),
+            })
+            continue
+
+        manifest = entry.get("manifest") or {}
+        parse_sidecar_filename = _validate_parse_sidecar_basename_shared(
+            str(entry["parse_sidecar_filename"])
+        )
+        analysis_dir = registry.ensure_analysis_dir(document_id)
+        parse_path = (analysis_dir / parse_sidecar_filename).resolve()
+
+        try:
+            import json as _json
+            # Sidecar containment + symlink + size guards via shared helper
+            _guard_sidecar(parse_path, registry.registry_root.resolve(), _max_file_bytes(state))
+            from doc_workbench.intake.models import ParseRecord
+            parse_record = ParseRecord.from_dict(
+                _json.loads(parse_path.read_text(encoding="utf-8"))
+            )
+            extraction = run_extraction(
+                document_id=document_id,
+                manifest=manifest,
+                parse_record=parse_record,
+                parse_record_filename=parse_sidecar_filename,
+                run_id="langgraph",
+                parse_validation_errors=entry.get("validation_errors") or [],
+            )
+            extraction_sidecar_path = registry.write_analysis_sidecar(
+                document_id, "extraction_record", extraction.to_dict()
+            )
+            results.append({
+                "document_id": document_id,
+                "indexing_acceptance": extraction.indexing_acceptance,
+                "risk_level": extraction.risk_level,
+                "parse_sidecar_filename": parse_sidecar_filename,
+                "extraction_sidecar_filename": extraction_sidecar_path.name,
+                "manifest": manifest,
+            })
+        except Exception as exc:
+            from doc_workbench.execution_policy import PolicyViolationError as _PVE
+            if isinstance(exc, (_PVE, ValueError)):
+                raise
+            results.append({
+                "document_id": document_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {"extraction_records": results}
+
+
+def chunk_node(state: WorkbenchState) -> dict:
+    """LangGraph node: chunk index-ready documents.
+
+    Reads:  extraction_records (from state), intake_registry_root, intake_force
+    Writes: chunk_records
+    """
+    exec_policy = state.get("exec_policy")
+    if exec_policy is not None:
+        from doc_workbench.execution_policy import enforce_command_stage as _enforce
+        _enforce(exec_policy, "chunk")
+
+    import json as _json
+    import re as _re
+    from datetime import datetime as _dt, timezone as _tz
+    from doc_workbench.registry.document_registry import DocumentRegistry
+    from doc_workbench.intake.models import ParseRecord
+    from doc_workbench.intake.extractor import ExtractionRecord
+    from doc_workbench.knowledge.chunker import chunk_document
+    from doc_workbench.knowledge.packager import write_chunk_jsonl
+
+    registry = DocumentRegistry(state["intake_registry_root"])
+    registry_root = state["intake_registry_root"]
+    force: bool = bool(state.get("intake_force"))
+    extraction_records: list[dict] = state.get("extraction_records") or []
+
+    _REF_RE = _re.compile(r"^parse_record\.\d{8}T\d{6}\d+Z\.json$")
+
+    results: list[dict] = []
+    for entry in extraction_records:
+        document_id = str(entry.get("document_id") or "")
+        if "error" in entry:
+            results.append({"document_id": document_id, "error": entry["error"]})
+            continue
+
+        manifest = entry.get("manifest") or {}
+        pipeline_status = manifest.get("pipeline_status") or {}
+        if pipeline_status.get("chunking_status") == "complete" and not force:
+            continue
+
+        if entry.get("indexing_acceptance") != "index_ready":
+            registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "skipped"}})
+            continue
+
+        artifact_path = registry._normalize_manifest_path(str(manifest.get("local_path", "")))
+        try:
+            # Enforce root_restriction parity with CLI, then containment/symlink/size guards.
+            _enforce_registry_root_node(state, artifact_path)
+            _guard_artifact(artifact_path, Path(registry_root).resolve(), _max_file_bytes(state))
+
+            # Load the exact extraction sidecar written by extract_node in this
+            # graph run.  Validate the filename as a strict bare basename first
+            # (same pattern as parse sidecars) to block traversal values like
+            # '../other_doc/analysis/extraction_record.<ts>.json'.  Then assert
+            # the resolved path is owned by *this* document's analysis_dir, not
+            # merely somewhere under registry_root.
+            extraction_sidecar_filename = entry.get("extraction_sidecar_filename")
+            if not extraction_sidecar_filename:
+                raise FileNotFoundError(
+                    f"extraction_sidecar_filename missing from state for {document_id}; "
+                    "extract_node must run before chunk_node"
+                )
+            # Strict basename validation — raises ValueError on any traversal attempt.
+            extraction_sidecar_filename = _validate_extraction_sidecar_basename_shared(
+                str(extraction_sidecar_filename)
+            )
+            analysis_dir = registry.ensure_analysis_dir(document_id)
+            extraction_sidecar_path = (analysis_dir / extraction_sidecar_filename).resolve()
+            # Ownership check: path must be inside *this* document's analysis_dir,
+            # not just anywhere under registry_root.
+            try:
+                extraction_sidecar_path.relative_to(analysis_dir.resolve())
+            except ValueError:
+                raise ValueError(
+                    f"extraction_sidecar_path '{extraction_sidecar_path}' is outside "
+                    f"the analysis dir for document '{document_id}'. Blocked."
+                )
+            _guard_sidecar(extraction_sidecar_path, registry.registry_root.resolve(), _max_file_bytes(state))
+            extraction = ExtractionRecord.from_dict(
+                _json.loads(extraction_sidecar_path.read_text(encoding="utf-8"))
+            )
+
+            basename = extraction.parse_record_ref
+            if not _REF_RE.match(basename):
+                raise ValueError(f"Invalid parse_record_ref: {basename!r}")
+            # Also validate via shared helper for consistency
+            _validate_parse_sidecar_basename_shared(basename)
+            analysis_dir = registry.ensure_analysis_dir(document_id)
+            parse_path = (analysis_dir / basename).resolve()
+            _guard_sidecar(parse_path, registry.registry_root.resolve(), _max_file_bytes(state))
+            parse_record = ParseRecord.from_dict(
+                _json.loads(parse_path.read_text(encoding="utf-8"))
+            )
+
+            chunk_iter = chunk_document(
+                local_path=artifact_path,
+                manifest=manifest,
+                parse_record=parse_record,
+                extraction_record=extraction,
+                run_id="langgraph",
+            )
+            if chunk_iter is None:
+                registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "skipped"}})
+                continue
+
+            # Write JSONL with no-overwrite collision retry (up to 3 attempts).
+            # Existence pre-check + exclusive-create ("x") together close the TOCTOU window.
+            chunk_path = None
+            chunk_count = 0
+            for _attempt in range(3):
+                ts = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%S%f") + "Z"
+                candidate = analysis_dir / f"chunks.{ts}.jsonl"
+                if candidate.exists() or candidate.is_symlink():
+                    continue
+                try:
+                    chunk_count = write_chunk_jsonl(chunk_iter, candidate)
+                    chunk_path = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if chunk_path is None:
+                raise RuntimeError(
+                    f"Failed to write chunk JSONL after 3 attempts for {document_id}"
+                )
+            registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "complete"}})
+            results.append({
+                "document_id": document_id,
+                "chunk_count": chunk_count,
+                "chunk_file": chunk_path.name,
+            })
+        except Exception as exc:
+            from doc_workbench.execution_policy import PolicyViolationError as _PVE
+            if isinstance(exc, (_PVE, ValueError)):
+                raise
+            results.append({"document_id": document_id, "error": f"{type(exc).__name__}: {exc}"})
+            try:
+                registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "failed"}})
+            except Exception:
+                pass
+
+    return {"chunk_records": results}

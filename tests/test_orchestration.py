@@ -252,3 +252,394 @@ def test_run_graph_full_mode_produces_review_rows(tmp_path: Path) -> None:
     assert len(final_state["review_rows"]) >= 1
     # Top candidate should be approved
     assert final_state["review_rows"][0].recommendation == "approved"
+
+
+# ---------------------------------------------------------------------------
+# Intake graph tests
+# ---------------------------------------------------------------------------
+
+from doc_workbench.orchestration.graph import build_intake_graph  # noqa: E402
+from doc_workbench.orchestration.nodes import parse_node, extract_node, chunk_node  # noqa: E402
+
+
+def test_intake_graph_compiles() -> None:
+    """build_intake_graph() must return a compiled graph without error."""
+    graph = build_intake_graph()
+    assert graph is not None
+
+
+def test_parse_node_raises_without_document_selection_input() -> None:
+    """parse_node must raise ValueError when no intake target selector is set."""
+    import pytest
+    state: WorkbenchState = {}
+    with pytest.raises(ValueError, match="intake"):
+        parse_node(state)
+
+
+def test_extract_node_passthrough_on_empty_parse_records(tmp_path: Path) -> None:
+    """extract_node with an empty parse_records list must return extraction_records=[]."""
+    state: WorkbenchState = {
+        "intake_registry_root": tmp_path,
+        "parse_records": [],
+    }
+    result = extract_node(state)
+    assert result == {"extraction_records": []}
+
+
+def test_extract_node_passes_error_entries_through(tmp_path: Path) -> None:
+    """extract_node must propagate error entries from parse_records unchanged."""
+    state: WorkbenchState = {
+        "intake_registry_root": tmp_path,
+        "parse_records": [
+            {"document_id": "doc001", "error": "ParseError: something failed"},
+        ],
+    }
+    result = extract_node(state)
+    assert len(result["extraction_records"]) == 1
+    assert result["extraction_records"][0]["document_id"] == "doc001"
+    assert "error" in result["extraction_records"][0]
+
+
+def test_chunk_node_passthrough_on_empty_extraction_records(tmp_path: Path) -> None:
+    """chunk_node with an empty extraction_records list must return chunk_records=[]."""
+    state: WorkbenchState = {
+        "intake_registry_root": tmp_path,
+        "extraction_records": [],
+    }
+    result = chunk_node(state)
+    assert result == {"chunk_records": []}
+
+
+def test_intake_graph_nodes_are_parse_extract_chunk(tmp_path: Path) -> None:
+    """Compiled intake graph node names must be parse, extract, and chunk."""
+    graph = build_intake_graph()
+    # Registry root is empty so list_manifests returns []; graph should run cleanly.
+    with patch("doc_workbench.registry.document_registry.DocumentRegistry.list_manifests", return_value=[]):
+        state: WorkbenchState = {
+            "intake_all": True,
+            "intake_registry_root": tmp_path,
+        }
+        final = graph.invoke(state)
+    assert "parse_records" in final
+    assert "extraction_records" in final
+    assert "chunk_records" in final
+
+
+# ---------------------------------------------------------------------------
+# Intake node policy enforcement (enforce_command_stage parity)
+# ---------------------------------------------------------------------------
+
+def test_parse_node_rejects_policy_stage_violation(tmp_path: Path) -> None:
+    """parse_node must raise PolicyViolationError when exec_policy forbids 'analyze'."""
+    import yaml
+    from doc_workbench.execution_policy import load_execution_policy, PolicyViolationError
+
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text(
+        yaml.dump({
+            "allowed_command_stages": ["discover"],  # 'analyze' absent
+            "allowed_source_families": ["*"],
+            "download": {"enabled": True, "max_count": 10, "max_file_size_bytes": 1000, "allowed_mime_types": ["application/pdf"]},
+            "followup_search": {"enabled": False},
+            "registry": {"root_restriction": "registry"},
+        }),
+        encoding="utf-8",
+    )
+    exec_policy = load_execution_policy(str(policy_file))
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": tmp_path,
+        "exec_policy": exec_policy,
+    }
+    with pytest.raises(PolicyViolationError):
+        parse_node(state)
+
+
+def test_chunk_node_rejects_policy_stage_violation(tmp_path: Path) -> None:
+    """chunk_node must raise PolicyViolationError when exec_policy forbids 'chunk'."""
+    import yaml
+    from doc_workbench.execution_policy import load_execution_policy, PolicyViolationError
+
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text(
+        yaml.dump({
+            "allowed_command_stages": ["discover", "analyze"],  # 'chunk' absent
+            "allowed_source_families": ["*"],
+            "download": {"enabled": True, "max_count": 10, "max_file_size_bytes": 1000, "allowed_mime_types": ["application/pdf"]},
+            "followup_search": {"enabled": False},
+            "registry": {"root_restriction": "registry"},
+        }),
+        encoding="utf-8",
+    )
+    exec_policy = load_execution_policy(str(policy_file))
+    state: WorkbenchState = {
+        "intake_registry_root": tmp_path,
+        "extraction_records": [],
+        "exec_policy": exec_policy,
+    }
+    with pytest.raises(PolicyViolationError):
+        chunk_node(state)
+
+
+def test_parse_node_rejects_exec_policy_without_workspace_root(tmp_path: Path) -> None:
+    """parse_node must raise PolicyViolationError when exec_policy is set but
+    intake_workspace_root is absent — enforcing root_restriction parity with CLI."""
+    import yaml
+    from doc_workbench.execution_policy import load_execution_policy, PolicyViolationError
+    from doc_workbench.orchestration.nodes import parse_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    # Policy allows 'analyze' so stage check passes; workspace_root is absent → must fail.
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text(
+        yaml.dump({
+            "allowed_command_stages": ["analyze", "chunk"],
+            "allowed_source_families": ["*"],
+            "download": {"enabled": True, "max_count": 10, "max_file_size_bytes": 52428800,
+                         "allowed_mime_types": ["application/pdf"]},
+            "followup_search": {"enabled": False},
+            "registry": {"root_restriction": "registry"},
+        }),
+        encoding="utf-8",
+    )
+    exec_policy = load_execution_policy(str(policy_file))
+
+    # Register a real download-complete document so parse_node reaches the artifact guard.
+    registry_root = tmp_path / "registry"
+    registry = DocumentRegistry(registry_root)
+    import io
+    minimal_pdf = (
+        b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/MediaBox[0 0 3 3]>>endobj\n"
+        b"xref\n0 4\n0000000000 65535 f\n"
+        b"0000000009 00000 n\n0000000058 00000 n\n"
+        b"0000000115 00000 n\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF"
+    )
+    registry.register_document(
+        entity_id="ent_test",
+        entity_name="Test Corp",
+        source_url="https://example.com/report.pdf",
+        family="annual_reports",
+        doc_type="official_pdf",
+        year="2024",
+        pdf_bytes=minimal_pdf,
+    )
+
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+        "exec_policy": exec_policy,
+        # intake_workspace_root intentionally absent
+    }
+    with pytest.raises(PolicyViolationError, match="intake_workspace_root must be set"):
+        parse_node(state)
+
+
+# ---------------------------------------------------------------------------
+# Shared intake guards (doc_workbench.intake.guards)
+# ---------------------------------------------------------------------------
+
+def test_check_sidecar_path_rejects_oversized_sidecar(tmp_path: Path) -> None:
+    """check_sidecar_path must raise ValueError when sidecar exceeds the size limit."""
+    from doc_workbench.intake.guards import check_sidecar_path
+
+    sidecar = tmp_path / "parse_record.20240101T000000000000Z.json"
+    sidecar.write_text("x" * 100, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="size"):
+        check_sidecar_path(sidecar, registry_root=tmp_path, max_file_bytes=10)
+
+
+def test_check_artifact_path_rejects_oversized_artifact(tmp_path: Path) -> None:
+    """check_artifact_path must raise ValueError when artifact exceeds size limit."""
+    from doc_workbench.intake.guards import check_artifact_path
+
+    artifact = tmp_path / "doc.pdf"
+    artifact.write_bytes(b"x" * 100)
+
+    with pytest.raises(ValueError, match="size"):
+        check_artifact_path(artifact, registry_root=tmp_path, max_file_bytes=10)
+
+
+def test_check_artifact_path_rejects_symlink(tmp_path: Path) -> None:
+    """check_artifact_path must raise ValueError for symlinked artifacts."""
+    from doc_workbench.intake.guards import check_artifact_path
+
+    real_file = tmp_path / "real.pdf"
+    real_file.write_bytes(b"data")
+    link = tmp_path / "link.pdf"
+    link.symlink_to(real_file)
+
+    with pytest.raises(ValueError, match="[Ss]ymlink"):
+        check_artifact_path(link, registry_root=tmp_path)
+
+
+def test_check_sidecar_path_rejects_path_outside_registry(tmp_path: Path) -> None:
+    """check_sidecar_path must raise ValueError when path is outside registry_root."""
+    import tempfile
+    from doc_workbench.intake.guards import check_sidecar_path
+
+    with tempfile.TemporaryDirectory() as other_dir:
+        sidecar = Path(other_dir) / "leaked.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError, match="outside registry root"):
+            check_sidecar_path(sidecar, registry_root=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Happy-path node tests (parse_node → extract_node → chunk_node)
+# ---------------------------------------------------------------------------
+
+def _make_registry_with_pdf(tmp_path: Path):
+    """Register a blank PDF with download_status=complete; return (registry_root, document_id)."""
+    from io import BytesIO
+    from pypdf import PdfWriter
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_metadata({"/Title": "Node Test 2024"})
+    buf = BytesIO()
+    writer.write(buf)
+    pdf_bytes = buf.getvalue()
+
+    registry_root = tmp_path / "registry"
+    registry = DocumentRegistry(registry_root)
+    result = registry.register_document(
+        entity_id="ent_nodetest",
+        entity_name="Node Test Corp",
+        source_url="https://example.com/node_test.pdf",
+        family="annual_reports",
+        doc_type="official_pdf",
+        year="2024",
+        pdf_bytes=pdf_bytes,
+    )
+    return registry_root, result.document_id
+
+
+def test_parse_node_happy_path(tmp_path: Path) -> None:
+    """parse_node must write a parse_record sidecar and return parse_records in state."""
+    from doc_workbench.orchestration.nodes import parse_node
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    result = parse_node(state)
+
+    assert "parse_records" in result
+    assert len(result["parse_records"]) == 1
+    entry = result["parse_records"][0]
+    assert entry["document_id"] == doc_id
+    assert "error" not in entry
+    assert entry.get("parse_sidecar_filename", "").startswith("parse_record.")
+    # Sidecar must physically exist on disk.
+    from doc_workbench.registry.document_registry import DocumentRegistry
+    registry = DocumentRegistry(registry_root)
+    sidecars = registry.list_analysis_sidecars(doc_id, "parse_record")
+    assert len(sidecars) == 1
+
+
+def test_extract_node_happy_path(tmp_path: Path) -> None:
+    """extract_node must write an extraction_record sidecar and return extraction_records."""
+    from doc_workbench.orchestration.nodes import parse_node, extract_node
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    parse_result = parse_node(state)
+    state = {**state, **parse_result}
+
+    extract_result = extract_node(state)
+    assert "extraction_records" in extract_result
+    assert len(extract_result["extraction_records"]) == 1
+    entry = extract_result["extraction_records"][0]
+    assert entry["document_id"] == doc_id
+    assert "error" not in entry
+    assert "extraction_sidecar_filename" in entry
+    assert entry["extraction_sidecar_filename"].startswith("extraction_record.")
+    # Sidecar must physically exist on disk.
+    from doc_workbench.registry.document_registry import DocumentRegistry
+    registry = DocumentRegistry(registry_root)
+    sidecars = registry.list_analysis_sidecars(doc_id, "extraction_record")
+    assert len(sidecars) == 1
+
+
+def test_chunk_node_happy_path_uses_exact_sidecar(tmp_path: Path) -> None:
+    """chunk_node must use extraction_sidecar_filename from state (not a disk scan)."""
+    from doc_workbench.orchestration.nodes import parse_node, extract_node, chunk_node
+    from doc_workbench.registry.document_registry import DocumentRegistry
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    state = {**state, **parse_node(state)}
+    state = {**state, **extract_node(state)}
+
+    # Verify extraction_sidecar_filename is threaded through state.
+    extraction_entry = state["extraction_records"][0]
+    assert "extraction_sidecar_filename" in extraction_entry
+
+    # Write a *second* competing extraction sidecar for the same document so
+    # that a disk-scan implementation (list_analysis_sidecars[-1]) would pick
+    # the wrong file.  The node must use the filename from state, not the latest.
+    import json, time as _time
+    from doc_workbench.registry.document_registry import DocumentRegistry as _R
+    registry = _R(registry_root)
+    analysis_dir = registry.ensure_analysis_dir(doc_id)
+    _time.sleep(0.01)  # ensure a distinct timestamp
+    competing_ts = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%f") + "Z"
+    competing_path = analysis_dir / f"extraction_record.{competing_ts}.json"
+    competing_path.write_text(
+        json.dumps({"document_id": doc_id, "_competing": True}), encoding="utf-8"
+    )
+    # Two sidecars on disk; state still carries the original filename.
+    sidecars_on_disk = registry.list_analysis_sidecars(doc_id, "extraction_record")
+    assert len(sidecars_on_disk) == 2
+
+    chunk_result = chunk_node(state)
+    assert "chunk_records" in chunk_result
+    # Blank PDF → chunking_status=skipped (not an error).
+    updated = registry.get_manifest(doc_id)
+    assert updated["pipeline_status"].get("chunking_status") in ("skipped", "complete", "failed")
+
+
+def test_chunk_node_rejects_traversal_extraction_sidecar_filename(tmp_path: Path) -> None:
+    """chunk_node must reject extraction_sidecar_filename values containing path traversal."""
+    from doc_workbench.orchestration.nodes import parse_node, extract_node, chunk_node
+
+    registry_root, doc_id = _make_registry_with_pdf(tmp_path)
+    state: WorkbenchState = {
+        "intake_all": True,
+        "intake_registry_root": registry_root,
+    }
+    state = {**state, **parse_node(state)}
+    state = {**state, **extract_node(state)}
+
+    extraction_entry = state["extraction_records"][0]
+    real_filename = extraction_entry["extraction_sidecar_filename"]
+
+    # Craft a traversal filename that looks like it targets a sibling document.
+    traversal_filename = f"../other_doc/analysis/{real_filename}"
+    # Set indexing_acceptance=index_ready so chunk_node reaches the sidecar-load code.
+    tampered_records = [
+        {
+            **extraction_entry,
+            "indexing_acceptance": "index_ready",
+            "extraction_sidecar_filename": traversal_filename,
+        }
+    ]
+    tampered_state: WorkbenchState = {
+        **state,
+        "extraction_records": tampered_records,
+    }
+    with pytest.raises(ValueError, match="Invalid extraction sidecar filename"):
+        chunk_node(tampered_state)

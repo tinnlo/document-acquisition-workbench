@@ -44,6 +44,9 @@ from doc_workbench.orchestration.nodes import (
     followup_node,
     rank_node,
     review_prep_node,
+    parse_node,
+    extract_node,
+    chunk_node,
 )
 from doc_workbench.orchestration.state import WorkbenchState
 from doc_workbench.policy import ContextPolicy
@@ -137,3 +140,33 @@ def run_graph(
     }
 
     return graph.invoke(initial_state)
+
+
+def build_intake_graph() -> Any:
+    """Compile the intake StateGraph: parse → extract → chunk → END.
+
+    State must contain at least one of:
+      - intake_document_ids  (list of document ID strings)
+      - intake_entity_id     (string entity ID)
+      - intake_all           (bool True)
+
+    And the following paths:
+      - intake_registry_root (Path)
+
+    Optional:
+      - intake_force (bool, default False)
+
+    Returns the compiled graph.
+    """
+    builder: StateGraph = StateGraph(WorkbenchState)
+
+    builder.add_node("parse", parse_node)
+    builder.add_node("extract", extract_node)
+    builder.add_node("chunk", chunk_node)
+
+    builder.set_entry_point("parse")
+    builder.add_edge("parse", "extract")
+    builder.add_edge("extract", "chunk")
+    builder.add_edge("chunk", END)
+
+    return builder.compile()

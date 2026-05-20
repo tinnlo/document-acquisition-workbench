@@ -22,6 +22,8 @@ allowed_command_stages:
   - download
   - followup-search
   - scan
+  - analyze
+  - chunk
 
 # ---------------------------------------------------------------------------
 # Source / domain family permissions

@@ -5,11 +5,11 @@ import contextlib
 import csv
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 import click
 import time
 from pathlib import Path
-
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -26,6 +26,11 @@ from doc_workbench.acquisition.followup.workflow import (
     write_followup_artifacts,
 )
 from doc_workbench.config import VALID_ENGINES, WorkspacePaths, resolve_engine
+from doc_workbench.intake.guards import (
+    check_artifact_path as _guard_artifact,
+    check_sidecar_path as _guard_sidecar,
+    validate_parse_sidecar_basename as _validate_parse_sidecar_basename,
+)
 from doc_workbench.models import DownloadRow, MetadataScanRow
 from doc_workbench.observability.tracer import RunTrace, summarize_trace
 from doc_workbench.execution_policy import (
@@ -643,3 +648,407 @@ def scan(
         console.print(f"Metadata scan results: {json_path}")
         console.print(f"Resolved execution policy: {output_dir / 'resolved_execution_policy.json'}")
         console.print(f"Trace file: {trace_path}")
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for analyze + chunk
+# ---------------------------------------------------------------------------
+
+def _reject_symlink_artifact(artifact_path: Path) -> None:
+    """Raise ValueError if *artifact_path* is a symlink."""
+    if artifact_path.is_symlink():
+        raise ValueError(
+            f"Symlink detected at artifact path {artifact_path}. Read blocked."
+        )
+
+
+def _validate_parse_record_ref(ref: str) -> str:
+    """Validate and return the basename from a parse_record_ref value."""
+    return _validate_parse_sidecar_basename(ref)
+
+
+# ---------------------------------------------------------------------------
+# analyze command
+# ---------------------------------------------------------------------------
+
+@app.command("analyze")
+def analyze(
+    entity_id: str = typer.Option("", "--entity-id"),
+    all_: bool = typer.Option(False, "--all"),
+    workspace_root: str | None = typer.Option(None, "--workspace-root"),
+    force: bool = typer.Option(False, "--force"),
+    execution_policy_path: str | None = typer.Option(None, "--execution-policy-path"),
+) -> None:
+    """Parse and extract metadata from downloaded artifacts."""
+    with _policy_guard():
+        if not entity_id and not all_:
+            raise typer.BadParameter("Pass --all or --entity-id.")
+        if entity_id and all_:
+            raise typer.BadParameter("Pass exactly one of --all or --entity-id, not both.")
+        paths = WorkspacePaths.resolve(workspace_root)
+        paths.ensure()
+        exec_policy = load_execution_policy(execution_policy_path)
+        enforce_command_stage(exec_policy, "analyze")
+        registry = DocumentRegistry(paths.registry_root, exec_policy=exec_policy)
+        manifests = registry.list_manifests(entity_id or None)
+        output_dir, run_id = paths.new_run_dir("analyze")
+        trace_id = uuid.uuid4().hex
+        tracer = RunTrace(
+            trace_id=trace_id,
+            run_id=run_id,
+            command="analyze",
+            policy_digest="",
+            exec_policy_digest=exec_policy.digest,
+        )
+
+        from doc_workbench.intake.parser import run_parse
+        from doc_workbench.intake.validation import validate_parse_record
+        from doc_workbench.intake.extractor import run_extraction
+
+        processed = []
+        skipped = []
+        errors = []
+        start = time.perf_counter()
+
+        for manifest in manifests:
+            document_id = str(manifest.get("document_id") or "")
+            pipeline_status = manifest.get("pipeline_status") or {}
+            download_status = pipeline_status.get("download_status", "")
+            parse_status = pipeline_status.get("parse_status", "pending")
+
+            if download_status != "complete":
+                skipped.append({"document_id": document_id, "reason": f"download_status={download_status!r}"})
+                console.print(f"[yellow]skip[/yellow] {document_id}: download_status={download_status!r}")
+                continue
+
+            if parse_status == "complete" and not force:
+                skipped.append({"document_id": document_id, "reason": "parse_status=complete (use --force to re-run)"})
+                console.print(f"[dim]skip[/dim] {document_id}: already analyzed")
+                continue
+
+            artifact_path = registry._normalize_manifest_path(str(manifest["local_path"]))
+            try:
+                # --- path security guards (mirrors scan/download) ---
+                enforce_registry_root(exec_policy, artifact_path, paths.root)
+                _guard_artifact(artifact_path, paths.registry_root, exec_policy.download.max_file_size_bytes)
+
+                # --- parse ---
+                record = run_parse(
+                    document_id=document_id,
+                    local_path=artifact_path,
+                    manifest=manifest,
+                    run_id=run_id,
+                )
+                validation_errs = validate_parse_record(record)
+
+                # --- write parse sidecar ---
+                parse_sidecar_path = registry.write_analysis_sidecar(
+                    document_id, "parse_record", record.to_dict()
+                )
+                parse_sidecar_filename = parse_sidecar_path.name
+
+                # --- extract ---
+                extraction = run_extraction(
+                    document_id=document_id,
+                    manifest=manifest,
+                    parse_record=record,
+                    parse_record_filename=parse_sidecar_filename,
+                    run_id=run_id,
+                    parse_validation_errors=validation_errs,
+                )
+
+                # --- write extraction sidecar ---
+                registry.write_analysis_sidecar(
+                    document_id, "extraction_record", extraction.to_dict()
+                )
+
+                # --- update manifest parse_status ---
+                registry.update_manifest(document_id, {
+                    "pipeline_status": {"parse_status": record.parse_status}
+                })
+
+                processed.append({
+                    "document_id": document_id,
+                    "entity_id": str(manifest.get("entity_id") or ""),
+                    "parse_status": record.parse_status,
+                    "indexing_acceptance": extraction.indexing_acceptance,
+                    "risk_level": extraction.risk_level,
+                    "parse_record_file": parse_sidecar_filename,
+                    "extraction_record_file": registry.list_analysis_sidecars(
+                        document_id, "extraction_record"
+                    )[-1].name,
+                    "validation_errors": validation_errs,
+                })
+                console.print(
+                    f"[green]ok[/green] {document_id}: "
+                    f"parse_status={record.parse_status} "
+                    f"acceptance={extraction.indexing_acceptance}"
+                )
+
+            except PolicyViolationError:
+                raise
+            except Exception as exc:
+                errors.append({"document_id": document_id, "error": f"{type(exc).__name__}: {exc}"})
+                console.print(f"[red]error[/red] {document_id}: {exc}")
+
+        results = {
+            "run_id": run_id,
+            "command": "analyze",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+        }
+        results_path = output_dir / "analyze_results.json"
+        results_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # summary CSV
+        csv_path = output_dir / "analyze_summary.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=[
+                "document_id", "entity_id", "parse_status",
+                "indexing_acceptance", "risk_level",
+                "parse_record_file", "extraction_record_file",
+            ])
+            writer.writeheader()
+            for row in processed:
+                writer.writerow({k: row.get(k, "") for k in writer.fieldnames})
+
+        tracer.add_span(
+            entity_id=entity_id or "all",
+            stage="analyze_documents",
+            provider="intake_parser",
+            latency_ms=(time.perf_counter() - start) * 1000.0,
+            candidate_count_in=len(manifests),
+            candidate_count_out=len(processed),
+        )
+        trace_path = tracer.write(paths.traces_root / f"{run_id}.json")
+        write_resolved_execution_policy(output_dir / "resolved_execution_policy.json", exec_policy)
+        console.print(f"Analyze results: {results_path}")
+        console.print(f"Analyze summary: {csv_path}")
+        console.print(f"Resolved execution policy: {output_dir / 'resolved_execution_policy.json'}")
+        console.print(f"Trace file: {trace_path}")
+        if errors:
+            console.print(f"[red]Error: {len(errors)} document(s) failed during analyze.[/red]")
+            raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# chunk command
+# ---------------------------------------------------------------------------
+
+@app.command("chunk")
+def chunk(
+    entity_id: str = typer.Option("", "--entity-id"),
+    all_: bool = typer.Option(False, "--all"),
+    workspace_root: str | None = typer.Option(None, "--workspace-root"),
+    force: bool = typer.Option(False, "--force"),
+    execution_policy_path: str | None = typer.Option(None, "--execution-policy-path"),
+) -> None:
+    """Chunk index-ready documents into retrieval-ready JSONL records."""
+    with _policy_guard():
+        if not entity_id and not all_:
+            raise typer.BadParameter("Pass --all or --entity-id.")
+        if entity_id and all_:
+            raise typer.BadParameter("Pass exactly one of --all or --entity-id, not both.")
+        paths = WorkspacePaths.resolve(workspace_root)
+        paths.ensure()
+        exec_policy = load_execution_policy(execution_policy_path)
+        enforce_command_stage(exec_policy, "chunk")
+        registry = DocumentRegistry(paths.registry_root, exec_policy=exec_policy)
+        manifests = registry.list_manifests(entity_id or None)
+        output_dir, run_id = paths.new_run_dir("chunk")
+        trace_id = uuid.uuid4().hex
+        tracer = RunTrace(
+            trace_id=trace_id,
+            run_id=run_id,
+            command="chunk",
+            policy_digest="",
+            exec_policy_digest=exec_policy.digest,
+        )
+
+        from doc_workbench.intake.models import ParseRecord
+        from doc_workbench.intake.extractor import ExtractionRecord
+        from doc_workbench.knowledge.chunker import chunk_document
+        from doc_workbench.knowledge.packager import write_chunk_jsonl
+
+        processed = []
+        skipped = []
+        errors = []
+        start = time.perf_counter()
+
+        for manifest in manifests:
+            document_id = str(manifest.get("document_id") or "")
+            pipeline_status = manifest.get("pipeline_status") or {}
+            parse_status = pipeline_status.get("parse_status", "pending")
+            chunking_status = pipeline_status.get("chunking_status", "pending")
+
+            artifact_path = registry._normalize_manifest_path(str(manifest["local_path"]))
+
+            # --- path/size/symlink guards on artifact (same as scan/download) ---
+            try:
+                enforce_registry_root(exec_policy, artifact_path, paths.root)
+                _guard_artifact(artifact_path, paths.registry_root, exec_policy.download.max_file_size_bytes)
+            except PolicyViolationError:
+                raise
+            except Exception as exc:
+                errors.append({"document_id": document_id, "error": f"{type(exc).__name__}: {exc}"})
+                console.print(f"[red]error[/red] {document_id}: {exc}")
+                try:
+                    registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "failed"}})
+                except Exception:
+                    pass
+                continue
+
+            # --- triage: non-complete parse → skipped ---
+            if parse_status != "complete":
+                registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "skipped"}})
+                skipped.append({"document_id": document_id, "reason": f"parse_status={parse_status!r}"})
+                console.print(f"[yellow]skip[/yellow] {document_id}: parse_status={parse_status!r}")
+                continue
+
+            # --- skip if already chunked (unless --force) ---
+            if chunking_status == "complete" and not force:
+                skipped.append({"document_id": document_id, "reason": "chunking_status=complete (use --force to re-run)"})
+                console.print(f"[dim]skip[/dim] {document_id}: already chunked")
+                continue
+
+            try:
+                # --- load latest extraction record ---
+                extraction_sidecar_paths = registry.list_analysis_sidecars(document_id, "extraction_record")
+                if not extraction_sidecar_paths:
+                    raise FileNotFoundError(f"No extraction_record sidecar found for {document_id}")
+                extraction_sidecar_path = extraction_sidecar_paths[-1]
+
+                if extraction_sidecar_path.is_symlink():
+                    raise ValueError(
+                        f"Symlink at extraction_record sidecar {extraction_sidecar_path}. Read blocked."
+                    )
+                _guard_sidecar(extraction_sidecar_path, paths.registry_root, exec_policy.download.max_file_size_bytes)
+                extraction_data = json.loads(extraction_sidecar_path.read_text(encoding="utf-8"))
+                extraction = ExtractionRecord.from_dict(extraction_data)
+
+                # --- skip non-index-ready ---
+                if extraction.indexing_acceptance != "index_ready":
+                    registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "skipped"}})
+                    skipped.append({
+                        "document_id": document_id,
+                        "reason": f"indexing_acceptance={extraction.indexing_acceptance!r}",
+                    })
+                    console.print(
+                        f"[yellow]skip[/yellow] {document_id}: "
+                        f"indexing_acceptance={extraction.indexing_acceptance!r}"
+                    )
+                    continue
+
+                # --- validate + resolve parse_record_ref ---
+                ref = extraction.parse_record_ref
+                safe_basename = _validate_parse_record_ref(ref)
+                analysis_dir = registry.ensure_analysis_dir(document_id)
+                parse_sidecar_path = (analysis_dir / safe_basename).resolve()
+                registry_resolved = registry.registry_root.resolve()
+                try:
+                    parse_sidecar_path.relative_to(registry_resolved)
+                except ValueError:
+                    raise ValueError(
+                        f"parse_record_ref resolves outside registry root: {parse_sidecar_path}"
+                    )
+                if not parse_sidecar_path.exists():
+                    raise FileNotFoundError(
+                        f"parse_record_ref {ref!r} not found at {parse_sidecar_path}"
+                    )
+                if parse_sidecar_path.is_symlink():
+                    raise ValueError(
+                        f"Symlink at parse_record sidecar {parse_sidecar_path}. Read blocked."
+                    )
+
+                _guard_sidecar(parse_sidecar_path, paths.registry_root, exec_policy.download.max_file_size_bytes)
+                parse_data = json.loads(parse_sidecar_path.read_text(encoding="utf-8"))
+                parse_record = ParseRecord.from_dict(parse_data)
+
+                # --- chunk ---
+                chunk_iter = chunk_document(
+                    local_path=artifact_path,
+                    manifest=manifest,
+                    parse_record=parse_record,
+                    extraction_record=extraction,
+                    run_id=run_id,
+                )
+
+                if chunk_iter is None:
+                    # non-chunkable (HTML, scanned, etc.)
+                    registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "skipped"}})
+                    skipped.append({"document_id": document_id, "reason": "chunk_document returned None (non-chunkable)"})
+                    console.print(f"[yellow]skip[/yellow] {document_id}: non-chunkable strategy")
+                    continue
+
+                # --- stream-write JSONL with no-overwrite collision retry ---
+                # Existence pre-check + exclusive-create ("x") in write_chunk_jsonl
+                # together close the TOCTOU window: pre-check skips obvious collisions,
+                # exclusive-create raises FileExistsError on any late collision.
+                from datetime import datetime as _dt, timezone as _tz
+                chunk_path = None
+                chunk_count = 0
+                for _attempt in range(3):
+                    ts = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%S%f") + "Z"
+                    candidate = analysis_dir / f"chunks.{ts}.jsonl"
+                    if candidate.exists() or candidate.is_symlink():
+                        continue
+                    try:
+                        chunk_count = write_chunk_jsonl(chunk_iter, candidate)
+                        chunk_path = candidate
+                        break
+                    except FileExistsError:
+                        continue
+                if chunk_path is None:
+                    raise RuntimeError(
+                        f"Failed to write chunk JSONL after 3 attempts for {document_id}"
+                    )
+                chunk_filename = chunk_path.name
+
+                registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "complete"}})
+                processed.append({
+                    "document_id": document_id,
+                    "entity_id": str(manifest.get("entity_id") or ""),
+                    "chunk_count": chunk_count,
+                    "chunk_file": chunk_filename,
+                })
+                console.print(f"[green]ok[/green] {document_id}: {chunk_count} chunks → {chunk_filename}")
+
+            except PolicyViolationError:
+                raise
+            except Exception as exc:
+                errors.append({"document_id": document_id, "error": f"{type(exc).__name__}: {exc}"})
+                console.print(f"[red]error[/red] {document_id}: {exc}")
+                try:
+                    registry.update_manifest(document_id, {"pipeline_status": {"chunking_status": "failed"}})
+                except Exception:
+                    pass
+
+        results = {
+            "run_id": run_id,
+            "command": "chunk",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+        }
+        results_path = output_dir / "chunk_results.json"
+        results_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        tracer.add_span(
+            entity_id=entity_id or "all",
+            stage="chunk_documents",
+            provider="knowledge_chunker",
+            latency_ms=(time.perf_counter() - start) * 1000.0,
+            candidate_count_in=len(manifests),
+            candidate_count_out=len(processed),
+        )
+        trace_path = tracer.write(paths.traces_root / f"{run_id}.json")
+        write_resolved_execution_policy(output_dir / "resolved_execution_policy.json", exec_policy)
+        console.print(f"Chunk results: {results_path}")
+        console.print(f"Resolved execution policy: {output_dir / 'resolved_execution_policy.json'}")
+        console.print(f"Trace file: {trace_path}")
+        if errors:
+            console.print(f"[red]Error: {len(errors)} document(s) failed during chunk.[/red]")
+            raise typer.Exit(code=1)

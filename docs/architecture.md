@@ -136,6 +136,8 @@ Important nuance:
 | `review` | `doc_workbench/review/workflow.py` or orchestration nodes | Produces review queue and review trace |
 | `download` | `doc_workbench/storage/downloader.py` + `doc_workbench/registry/document_registry.py` | Fetches approved PDFs and records registry state |
 | `scan` | `doc_workbench/registry/metadata_scanner.py` | Adds lightweight PDF metadata to manifests |
+| `analyze` | `doc_workbench/intake/parser.py` + `doc_workbench/intake/extractor.py` | Parse and extract; writes versioned `parse_record` and `extraction_record` sidecars |
+| `chunk` | `doc_workbench/knowledge/chunker.py` + `doc_workbench/knowledge/packager.py` | Chunk text PDFs; writes `chunks.<ts>.jsonl` sidecars |
 | `eval` | `doc_workbench/evals/run_evals.py` | Reuses real ranking/review node logic |
 
 ## State Model
@@ -156,6 +158,14 @@ The LangGraph path threads a shared `WorkbenchState` through all nodes.
 | `review_rows` | `review_prep_node` | final review queue |
 | `review_trace` | `review_prep_node` | review explainability payload |
 | `recommendation_summary` | `review_prep_node` | aggregate recommendation counts |
+| `intake_document_ids` | caller | explicit document IDs for intake nodes (mutually exclusive with `intake_all`) |
+| `intake_entity_id` | caller | entity filter for intake nodes |
+| `intake_all` | caller | process all manifests |
+| `intake_force` | caller | re-run even if already analyzed/chunked |
+| `intake_registry_root` | caller | path to the registry root |
+| `parse_records` | `parse_node` | one entry per document from parse phase |
+| `extraction_records` | `extract_node` | one entry per document from extraction phase |
+| `chunk_records` | `chunk_node` | one entry per document from chunking phase |
 
 ## Artifact Surfaces
 
@@ -168,9 +178,35 @@ Artifact stability is one of the strongest architectural choices in the repo.
 | Download | `download_results.json`, `download_results.csv`, `resolved_execution_policy.json` | record of what was fetched and under which execution constraints |
 | Trace | `workspace/traces/{run_id}.json` | local execution record independent of remote telemetry |
 | Registry | `workspace/registry/*` | persistent downloaded-document state |
+| Analyze | `registry/<entity>/<family>/<year>/<type>/<doc_id>/analysis/parse_record.<ts>.json`, `extraction_record.<ts>.json` | versioned, immutable per-run parse and extraction sidecars |
+| Chunk | `registry/<entity>/<family>/<year>/<type>/<doc_id>/analysis/chunks.<ts>.jsonl` | retrieval-ready chunk records; one file per successful chunk run |
 | Eval | `eval_report.json` (written to current directory) | machine-readable regression report |
 
 The artifact filenames are intentionally stable across execution models so downstream consumers do not care whether the run was legacy or LangGraph-backed.
+
+### Intake pipeline: analyze + chunk
+
+The `analyze` command merges parse and extraction into a single step to avoid fragile two-step state. The `chunk` command is separate because chunking is only meaningful for `index_ready` documents, and splitting the commands allows selective retry without re-parsing.
+
+**Manifest vs. versioned sidecars:**
+
+The registry manifest (`metadata.json`) is the **canonical, mutable status record** for each document. It stores only lightweight pipeline status fields (`parse_status`, `chunking_status`). All richer, versioned artifacts live in **immutable timestamped sidecars** inside the document's `analysis/` subdirectory and are never overwritten. `indexing_acceptance` lives only in the `extraction_record` sidecar — it is **not** written to the manifest.
+
+**`analyze` flow:**
+1. Filter manifests by `download_status=complete`; skip if `parse_status=complete` (unless `--force`)
+2. Validate `local_path` containment, symlink rejection, file-size guard
+3. `detect_parse_strategy()` → `run_parse()` → `validate_parse_record()` → `run_extraction()`
+4. Write `parse_record.<ts>.json` and `extraction_record.<ts>.json` sidecars (timestamp-versioned, never overwritten)
+5. Update manifest `parse_status` only
+
+**`chunk` flow:**
+1. Skip if `parse_status != complete` (sets `chunking_status=skipped`)
+2. Load latest `extraction_record` sidecar; skip if `indexing_acceptance != index_ready`
+3. Validate `parse_record_ref` basename against `^parse_record\.\d{8}T\d{6}\d+Z\.json$`; resolve and containment-check
+4. `chunk_document()` → `Iterator[ChunkRecord] | None`; `None` → `chunking_status=skipped`
+5. `write_chunk_jsonl()` → `chunks.<ts>.jsonl` (no-overwrite collision retry); update manifest `chunking_status=complete`
+
+**LangGraph parity:** `parse_node`, `extract_node`, and `chunk_node` are independent node functions in `doc_workbench/orchestration/nodes.py`. `build_intake_graph()` in `doc_workbench/orchestration/graph.py` composes: `parse → extract → chunk → END`. `extract_node` reads `state["parse_records"]` and writes `state["extraction_records"]`; `chunk_node` reads `state["extraction_records"]` and writes `state["chunk_records"]`.
 
 ## Observability Model
 

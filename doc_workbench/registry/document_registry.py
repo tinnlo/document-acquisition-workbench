@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Regex for valid sidecar basenames (used in write_analysis_sidecar + list_analysis_sidecars).
+_BASENAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+# Regex for valid sidecar filenames returned by list_analysis_sidecars.
+_SIDECAR_FILE_RE = re.compile(r"^(?P<base>[a-zA-Z0-9_]+)\.\d{8}T\d{6}\d+Z\.(json|jsonl)$")
 
 from doc_workbench.config import slugify
 from doc_workbench.models import RegistrationResult
@@ -315,3 +321,173 @@ class DocumentRegistry:
             )
             return payload
         raise KeyError(f"Unknown document_id: {document_id}")
+
+    # ------------------------------------------------------------------
+    # Analysis sidecar helpers
+    # ------------------------------------------------------------------
+
+    def _find_manifest_path(self, document_id: str) -> Path:
+        """Return the resolved manifest path for *document_id*, or raise KeyError."""
+        for manifest_path in self._iter_manifest_paths():
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if payload.get("document_id") == document_id:
+                return manifest_path
+        raise KeyError(f"Unknown document_id: {document_id}")
+
+    def ensure_analysis_dir(self, document_id: str) -> Path:
+        """Create and return the ``analysis/`` directory for *document_id*.
+
+        Security contract
+        -----------------
+        - Resolves the path via Path.resolve() before any I/O.
+        - Asserts the resolved path is within registry_root.
+        - Raises ValueError if any component of the path is a symlink.
+        """
+        manifest_path = self._find_manifest_path(document_id)
+        analysis_dir = manifest_path.parent / "analysis"
+
+        # Symlink check: no component of the path up to and including analysis_dir
+        # may be a symlink.
+        for part in list(analysis_dir.parents) + [analysis_dir]:
+            if part.is_symlink():
+                raise ValueError(
+                    f"Symlink detected in analysis dir path: {part}. "
+                    "Symlinks are not allowed in the registry."
+                )
+
+        analysis_dir.mkdir(exist_ok=True)
+        resolved = analysis_dir.resolve()
+
+        registry_resolved = self.registry_root.resolve()
+        try:
+            resolved.relative_to(registry_resolved)
+        except ValueError:
+            raise ValueError(
+                f"analysis dir {resolved} escapes registry root {registry_resolved}. "
+                "Path traversal attempt blocked."
+            )
+
+        return resolved
+
+    def write_analysis_sidecar(
+        self, document_id: str, basename: str, data: dict[str, Any]
+    ) -> Path:
+        """Write *data* as a timestamped JSON sidecar under analysis/.
+
+        Used for JSON sidecars only (parse_record, extraction_record).
+        Chunk JSONL is written directly by packager.write_chunk_jsonl() using a path
+        obtained from ensure_analysis_dir().
+
+        Parameters
+        ----------
+        basename:
+            Must match ``^[a-zA-Z0-9_]+$`` — raises ValueError otherwise.
+        data:
+            dict payload to serialise as JSON.
+
+        Returns the path that was written.
+        """
+        if not _BASENAME_RE.match(basename):
+            raise ValueError(
+                f"Invalid sidecar basename {basename!r}. "
+                "Must match ^[a-zA-Z0-9_]+$"
+            )
+
+        analysis_dir = self.ensure_analysis_dir(document_id)
+        if analysis_dir.is_symlink():
+            raise ValueError(
+                f"Symlink detected at analysis directory {analysis_dir}. Write blocked."
+            )
+        registry_resolved = self.registry_root.resolve()
+
+        # Retry on same-microsecond collision (up to 3 attempts).
+        for attempt in range(3):
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "Z"
+            filename = f"{basename}.{ts}.json"
+            target = analysis_dir / filename
+
+            # Containment check after composing the full path.
+            resolved_target = analysis_dir / filename
+            try:
+                resolved_target.resolve().relative_to(registry_resolved)
+            except ValueError:
+                raise ValueError(
+                    f"Sidecar path {resolved_target} escapes registry root. "
+                    "Path traversal attempt blocked."
+                )
+
+            if target.is_symlink():
+                raise ValueError(
+                    f"Symlink detected at target path {target}. Write blocked."
+                )
+
+            try:
+                with target.open("x", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, ensure_ascii=False)
+                return target
+            except FileExistsError:
+                continue
+
+        raise RuntimeError(
+            f"Failed to write sidecar {basename!r} after 3 attempts due to timestamp collision."
+        )
+
+    def list_analysis_sidecars(self, document_id: str, basename: str) -> list[Path]:
+        """Return sorted list of existing sidecar paths matching *basename* (oldest first).
+
+        Parameters
+        ----------
+        basename:
+            Must match ``^[a-zA-Z0-9_]+$`` — raises ValueError otherwise.
+
+        Returns an empty list if the analysis/ directory does not exist.
+        Silently skips symlinks and files not matching the strict regex.
+        """
+        if not _BASENAME_RE.match(basename):
+            raise ValueError(
+                f"Invalid sidecar basename {basename!r}. "
+                "Must match ^[a-zA-Z0-9_]+$"
+            )
+
+        manifest_path = self._find_manifest_path(document_id)
+        analysis_dir = manifest_path.parent / "analysis"
+
+        if not analysis_dir.exists():
+            return []
+
+        # Reject a symlinked analysis/ directory itself before iterating.
+        if analysis_dir.is_symlink():
+            raise ValueError(
+                f"analysis/ directory for {document_id} is a symlink ({analysis_dir}). "
+                "Listing blocked."
+            )
+
+        registry_resolved = self.registry_root.resolve()
+        results: list[Path] = []
+
+        for entry in analysis_dir.iterdir():
+            # Reject symlinks.
+            if entry.is_symlink():
+                warnings.warn(
+                    f"Symlink {entry} in analysis dir skipped during listing.",
+                    stacklevel=2,
+                )
+                continue
+
+            m = _SIDECAR_FILE_RE.match(entry.name)
+            if not m or m.group("base") != basename:
+                continue
+
+            resolved = entry.resolve()
+            try:
+                resolved.relative_to(registry_resolved)
+            except ValueError:
+                warnings.warn(
+                    f"Sidecar {entry} resolves outside registry root — skipped.",
+                    stacklevel=2,
+                )
+                continue
+
+            results.append(resolved)
+
+        return sorted(results, key=lambda p: p.name)

@@ -215,6 +215,8 @@ doc-workbench followup-search --input workspace/runs/discover_*/discover.json
 doc-workbench review --input workspace/runs/discover_*/discover.json
 doc-workbench download --input workspace/runs/review_*/review_queue.csv
 doc-workbench scan --all
+doc-workbench analyze --all
+doc-workbench chunk --all
 doc-workbench eval
 ```
 
@@ -225,6 +227,8 @@ doc-workbench discover --entities examples/public_companies.csv --followup-searc
 doc-workbench review --input workspace/runs/discover_*/discover.json --engine langgraph
 doc-workbench download --input workspace/runs/review_*/review_queue.csv
 doc-workbench scan --all
+doc-workbench analyze --all
+doc-workbench chunk --all
 ```
 
 The bundled sample dataset lives in [`examples/public_companies.csv`](examples/public_companies.csv).
@@ -239,9 +243,30 @@ One of the strongest design signals in this repo is that downstream artifacts st
 | `review` | `review_queue.csv`, `review_trace.json`, `resolved_policy.json`, `resolved_execution_policy.json`, trace file | Human-review handoff with recommendation rationale and policy record |
 | `download` | downloaded files plus registry manifests, `resolved_execution_policy.json` | Persistent local registry for approved artifacts, under documented execution constraints |
 | `scan` | updated manifest metadata | Lightweight PDF metadata enrichment |
+| `analyze` | `parse_record.<ts>.json`, `extraction_record.<ts>.json` per document (versioned sidecars in registry `analysis/`); `analyze_results.json`, `analyze_summary.csv`, trace file | Versioned parse and extraction artifacts; sets `parse_status` on the manifest; `indexing_acceptance` lives only in the extraction sidecar |
+| `chunk` | `chunks.<ts>.jsonl` per document (sidecar in registry); `chunk_results.json`, trace file | Retrieval-ready chunk records for index-ready documents; sets `chunking_status` |
 | `eval` | `eval_report.json` (written to current directory) | Regression signal for ranking and recommendation behavior |
 
-## Policy, Explainability, And Observability
+### Manifest vs. versioned sidecars
+
+The registry manifest (`metadata.json`) for each document is the **canonical, mutable status record**. It tracks only lightweight pipeline status fields:
+
+| Manifest field | Written by | Meaning |
+|---|---|---|
+| `pipeline_status.download_status` | `download` | Whether the artifact has been fetched |
+| `pipeline_status.parse_status` | `analyze` | Whether parse completed |
+| `pipeline_status.chunking_status` | `chunk` | Whether chunking completed |
+
+All richer, versioned artifacts live in **immutable timestamped sidecars** inside each document's `analysis/` subdirectory and are never overwritten:
+
+| Sidecar | Written by | Contains |
+|---|---|---|
+| `parse_record.<ts>.json` | `analyze` | page count, parse strategy, quality signals (`sampled_nonempty_page_ratio`, `sampled_avg_chars_per_page`) |
+| `extraction_record.<ts>.json` | `analyze` | `indexing_acceptance`, `risk_level`, `fields`, `provenance` |
+| `chunks.<ts>.jsonl` | `chunk` | one `ChunkRecord` per line (text + metadata per page chunk) |
+
+`indexing_acceptance` is set only inside the `extraction_record` sidecar — it is **not** written to the manifest.
+
 
 ### Context policy
 
